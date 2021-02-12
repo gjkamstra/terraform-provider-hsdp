@@ -1,6 +1,7 @@
 package hsdp
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"github.com/hashicorp/go-cty/cty"
@@ -8,11 +9,19 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	"github.com/loafoe/easyssh-proxy/v2"
 	"github.com/philips-software/go-hsdp-api/cartel"
+	"os"
+
 	"log"
 	"net/http"
 	"strings"
 	"time"
+)
+
+const (
+	fileField     = "file"
+	commandsField = "commands"
 )
 
 func tagsSchema() *schema.Schema {
@@ -141,6 +150,47 @@ func resourceContainerHost() *schema.Resource {
 				Optional: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 			},
+			"bastion_host": {
+				Type:     schema.TypeString,
+				Optional: true,
+			},
+			"user": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				RequiredWith: []string{"private_key"},
+			},
+			"private_key": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Sensitive:    true,
+				RequiredWith: []string{"user"},
+			},
+			commandsField: {
+				Type:     schema.TypeList,
+				MaxItems: 10,
+				Optional: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+			},
+			fileField: {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"source": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"content": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"destination": {
+							Type:     schema.TypeString,
+							Required: true,
+						},
+					},
+				},
+			},
 			"subnet_type": {
 				Type:          schema.TypeString,
 				Optional:      true,
@@ -185,7 +235,7 @@ func resourceContainerHost() *schema.Resource {
 			},
 			"tags": tagsSchema(),
 		},
-		SchemaVersion: 2,
+		SchemaVersion: 3,
 	}
 }
 
@@ -226,6 +276,13 @@ func resourceContainerHostCreate(ctx context.Context, d *schema.ResourceData, m 
 	userGroups := expandStringList(d.Get("user_groups").(*schema.Set).List())
 	instanceRole := d.Get("instance_role").(string)
 	subnetType := d.Get("subnet_type").(string)
+	bastionHost := d.Get("bastion_host").(string)
+	if bastionHost == "" {
+		bastionHost = client.BastionHost()
+	}
+	user := d.Get("user").(string)
+	privateKey := d.Get("private_key").(string)
+
 	if subnetType == "" {
 		subnetType = "private"
 	}
@@ -235,6 +292,24 @@ func resourceContainerHostCreate(ctx context.Context, d *schema.ResourceData, m 
 	for t, v := range tagList {
 		if val, ok := v.(string); ok {
 			tags[t] = val
+		}
+	}
+	// Fetch files first before starting provisioning
+	createFiles, diags := collectFilesToCreate(d)
+	if len(diags) > 0 {
+		return diags
+	}
+	// And commands
+	commands, diags := collectCommands(d)
+	if len(diags) > 0 {
+		return diags
+	}
+	if len(commands) > 0 {
+		if user == "" {
+			return diag.FromErr(fmt.Errorf("user must be set when '%s' is specified", commandsField))
+		}
+		if privateKey == "" {
+			return diag.FromErr(fmt.Errorf("privateKey must be set when '%s' is specified", commandsField))
 		}
 	}
 
@@ -252,16 +327,30 @@ func resourceContainerHostCreate(ctx context.Context, d *schema.ResourceData, m 
 		cartel.Tags(tags),
 		cartel.InSubnet(subnet),
 	)
+	instanceID := ""
+	ipAddress := ""
 	if err != nil {
 		if resp == nil {
+			_, _, _ = client.Destroy(tagName)
 			return diag.FromErr(fmt.Errorf("create error (resp=nil): %w", err))
 		}
-		if ch == nil {
-			return diag.FromErr(fmt.Errorf("create error (instance=nil): %w", err))
+		if ch == nil || resp.StatusCode >= 500 { // Possible 504, or other timeout, try to recover!
+			if details := findInstanceByName(client, tagName); details != nil {
+				instanceID = details.InstanceID
+				ipAddress = details.PrivateAddress
+			} else {
+				_, _, _ = client.Destroy(tagName)
+				return diag.FromErr(fmt.Errorf("create error (status=%d): %w", resp.StatusCode, err))
+			}
+		} else {
+			_, _, _ = client.Destroy(tagName)
+			return diag.FromErr(fmt.Errorf("create error (description=[%s], code=[%d]): %w", ch.Description, resp.StatusCode, err))
 		}
-		return diag.FromErr(fmt.Errorf("create error (description=[%s]): %w", ch.Description, err))
+	} else {
+		instanceID = ch.InstanceID()
+		ipAddress = ch.IPAddress()
 	}
-	d.SetId(ch.InstanceID())
+	d.SetId(instanceID)
 
 	stateConf := &resource.StateChangeConf{
 		Pending:    []string{"provisioning", "indeterminate"},
@@ -276,14 +365,162 @@ func resourceContainerHostCreate(ctx context.Context, d *schema.ResourceData, m 
 		// Trigger a delete to prevent failed instances from lingering
 		_, _, _ = client.Destroy(tagName)
 		return diag.FromErr(fmt.Errorf(
-			"error waiting for instance (%s) to become ready: %s",
-			ch.InstanceID(), err))
+			"error waiting for instance '%s' to become ready: %s",
+			instanceID, err))
 	}
 	d.SetConnInfo(map[string]string{
 		"type": "ssh",
-		"host": ch.IPAddress(),
+		"host": ipAddress,
 	})
-	return resourceContainerHostRead(ctx, d, m)
+	// Collect SSH details
+	privateIP := ipAddress
+	ssh := &easyssh.MakeConfig{
+		User:   user,
+		Server: privateIP,
+		Port:   "22",
+		Key:    privateKey,
+		Proxy:  http.ProxyFromEnvironment,
+		Bastion: easyssh.DefaultConfig{
+			User:   user,
+			Server: bastionHost,
+			Port:   "22",
+			Key:    privateKey,
+		},
+	}
+
+	// Create files
+	if err := copyFiles(ssh, config, createFiles); err != nil {
+		diags = append(diags, diag.Diagnostic{
+			Severity: diag.Warning,
+			Summary:  "failed to copy all files",
+			Detail:   fmt.Sprintf("One or more files failed to copy: %v", err),
+		})
+	}
+
+	// Run commands
+	for i := 0; i < len(commands); i++ {
+		stdout, stderr, done, err := ssh.Run(commands[i], 5*time.Minute)
+		if err != nil {
+			return append(diags, diag.FromErr(fmt.Errorf("command [%s]: %w", commands[i], err))...)
+		} else {
+			_, _ = config.Debug("command: %s\ndone: %t\nstdout:\n%s\nstderr:\n%s\n", commands[i], done, stdout, stderr)
+		}
+	}
+	readDiags := resourceContainerHostRead(ctx, d, m)
+	return append(diags, readDiags...)
+}
+
+func findInstanceByName(client *cartel.Client, name string) *cartel.InstanceDetails {
+	instances, _, err := client.GetAllInstances()
+	if err != nil {
+		return nil
+	}
+	for _, i := range *instances {
+		if i.NameTag == name {
+			return &i
+		}
+	}
+	return nil
+}
+
+func copyFiles(ssh *easyssh.MakeConfig, config *Config, createFiles []provisionFile) error {
+	for _, f := range createFiles {
+		if f.Source != "" {
+			src, srcErr := os.Open(f.Source)
+			if srcErr != nil {
+				_, _ = config.Debug("Failed to open source file %s: %v\n", f.Source, srcErr)
+				return srcErr
+			}
+			srcStat, statErr := src.Stat()
+			if statErr != nil {
+				_, _ = config.Debug("Failed to stat source file %s: %v\n", f.Source, statErr)
+				_ = src.Close()
+				return statErr
+			}
+			_ = ssh.WriteFile(src, srcStat.Size(), f.Destination)
+			_, _ = config.Debug("Copied %s to remote file %s:%s: %d bytes\n", f.Source, ssh.Server, f.Destination, srcStat.Size())
+			_ = src.Close()
+		} else {
+			buffer := bytes.NewBufferString(f.Content)
+			// Should we fail the complete provision on errors here?
+			_ = ssh.WriteFile(buffer, int64(buffer.Len()), f.Destination)
+			_, _ = config.Debug("Created remote file %s:%s: %d bytes\n", ssh.Server, f.Destination, len(f.Content))
+		}
+	}
+	return nil
+}
+
+func collectCommands(d *schema.ResourceData) ([]string, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	list := d.Get(commandsField).([]interface{})
+	commands := make([]string, 0)
+	for i := 0; i < len(list); i++ {
+		commands = append(commands, list[i].(string))
+	}
+	return commands, diags
+
+}
+
+type provisionFile struct {
+	Source      string
+	Content     string
+	Destination string
+}
+
+func collectFilesToCreate(d *schema.ResourceData) ([]provisionFile, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	files := make([]provisionFile, 0)
+	if v, ok := d.GetOk(fileField); ok {
+		vL := v.(*schema.Set).List()
+		for _, vi := range vL {
+			mVi := vi.(map[string]interface{})
+			file := provisionFile{
+				Source:      mVi["source"].(string),
+				Content:     mVi["content"].(string),
+				Destination: mVi["destination"].(string),
+			}
+			if file.Source == "" && file.Content == "" {
+				diags = append(diags, diag.Diagnostic{
+					Severity: diag.Error,
+					Summary:  "conflict in file block",
+					Detail:   fmt.Sprintf("file %s has neither 'source' or 'content', set one", file.Destination),
+				})
+				continue
+			}
+			if file.Source != "" && file.Content != "" {
+				diags = append(diags, diag.Diagnostic{
+					Severity: diag.Error,
+					Summary:  "conflict in file block",
+					Detail:   fmt.Sprintf("file %s has conflicting 'source' and 'content', choose only one", file.Destination),
+				})
+				continue
+			}
+			if file.Source != "" {
+				src, srcErr := os.Open(file.Source)
+				if srcErr != nil {
+					diags = append(diags, diag.Diagnostic{
+						Severity: diag.Error,
+						Summary:  "issue with source",
+						Detail:   fmt.Sprintf("file %s: %v", file.Source, srcErr),
+					})
+					continue
+				}
+				_, statErr := src.Stat()
+				if statErr != nil {
+					diags = append(diags, diag.Diagnostic{
+						Severity: diag.Error,
+						Summary:  "issue with source stat",
+						Detail:   fmt.Sprintf("file %s: %v", file.Source, statErr),
+					})
+					_ = src.Close()
+					continue
+				}
+				_ = src.Close()
+			}
+			files = append(files, file)
+		}
+	}
+	return files, diags
 }
 
 func resourceContainerHostUpdate(_ context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {

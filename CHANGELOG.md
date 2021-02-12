@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## v0.12.2
+- Fix STL cert update issue 
+- Remove last_update fields as it produced inconsistent state
+
+## v0.12.1
+- Improve Proposition and Application resource lifecycle and error handling 
+- Sync STL resources by default now. Users can choose to batch this using `hsdp_stl_sync`
+
+## v0.12.0
+- [NEW] Secure Transport Layer (STL) support to manage Edge devices
+
+## v0.11.3
+- Fix default IAM OAuth2 client TTLs
+
+## v0.11.2
+- Fix documentation
+
+## v0.11.0
+- NEW: HSDP PKI initial support
+
+## v0.10.0
+- NEW: DICOM config support
+
+## v0.9.4
+- Better cleanup logic for failed container host provisions
+
+## v0.9.3
+- Recovery code for Cartel HTTP 500 error during create
+
+## v0.9.2
+- Improve error handling for Cartel
+
+## v0.9.1
+- Add support for file sources
+- Improve error handling
+
+## v0.9.0
+- [NEW] Use SSH file and commands directies for Container Host
+- [NEW] Add hsdp_container_host_exec as replacement for null_resource
+
+## v0.8.9
+- Add proxy support for Cartel connections
+
 ## v0.8.8
 - [NEW] Added hsdp_iam_email_template to manage IAM custom email templates
 

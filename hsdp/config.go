@@ -8,17 +8,23 @@ import (
 	"github.com/philips-software/go-hsdp-api/cdr"
 	"github.com/philips-software/go-hsdp-api/config"
 	"github.com/philips-software/go-hsdp-api/console"
-	"github.com/philips-software/go-hsdp-api/credentials"
+	"github.com/philips-software/go-hsdp-api/dicom"
 	"github.com/philips-software/go-hsdp-api/iam"
+	"github.com/philips-software/go-hsdp-api/pki"
+	"github.com/philips-software/go-hsdp-api/s3creds"
+	"github.com/philips-software/go-hsdp-api/stl"
 	"net/http"
+	"os"
 )
 
 // Config contains configuration for the client
 type Config struct {
 	iam.Config
+	BuildVersion      string
 	ServiceID         string
 	ServicePrivateKey string
 	S3CredsURL        string
+	STLURL            string
 	CartelHost        string
 	CartelToken       string
 	CartelSecret      string
@@ -31,12 +37,17 @@ type Config struct {
 
 	iamClient        *iam.Client
 	cartelClient     *cartel.Client
-	credsClient      *credentials.Client
+	s3credsClient    *s3creds.Client
 	consoleClient    *console.Client
+	pkiClient        *pki.Client
+	stlClient        *stl.Client
+	debugFile        *os.File
 	credsClientErr   error
 	cartelClientErr  error
 	iamClientErr     error
 	consoleClientErr error
+	pkiClientErr     error
+	stlClientErr     error
 	TimeZone         string
 
 	ma *jsonformat.Marshaller
@@ -50,15 +61,32 @@ func (c *Config) CartelClient() (*cartel.Client, error) {
 	return c.cartelClient, c.cartelClientErr
 }
 
-func (c *Config) CredentialsClient() (*credentials.Client, error) {
-	return c.credsClient, c.credsClientErr
+func (c *Config) S3CredsClient() (*s3creds.Client, error) {
+	return c.s3credsClient, c.credsClientErr
 }
 
 func (c *Config) ConsoleClient() (*console.Client, error) {
 	return c.consoleClient, c.consoleClientErr
 }
 
-func (c *Config) CredentialsClientWithLogin(username, password string) (*credentials.Client, error) {
+func (c *Config) STLClient(endpoint ...string) (*stl.Client, error) {
+	return c.stlClient, c.stlClientErr
+}
+
+func (c *Config) PKIClient(regionEnvironment ...string) (*pki.Client, error) {
+	if len(regionEnvironment) == 2 && c.consoleClient != nil && c.iamClient != nil {
+		region := regionEnvironment[0]
+		environment := regionEnvironment[1]
+		return pki.NewClient(c.consoleClient, c.iamClient, &pki.Config{
+			Region:      region,
+			Environment: environment,
+			DebugLog:    c.DebugLog,
+		})
+	}
+	return c.pkiClient, c.pkiClientErr
+}
+
+func (c *Config) CredentialsClientWithLogin(username, password string) (*s3creds.Client, error) {
 	if c.iamClientErr != nil {
 		return nil, c.iamClientErr
 	}
@@ -66,7 +94,7 @@ func (c *Config) CredentialsClientWithLogin(username, password string) (*credent
 	if err != nil {
 		return nil, err
 	}
-	return credentials.NewClient(newIAMClient, &credentials.Config{
+	return s3creds.NewClient(newIAMClient, &s3creds.Config{
 		BaseURL:  c.S3CredsURL,
 		DebugLog: c.DebugLog,
 	})
@@ -106,10 +134,37 @@ func (c *Config) setupIAMClient() {
 	c.iamClient = client
 }
 
-// setupS3CredsClient sets up an HSDP S3 Credentials client
+func (c *Config) setupSTLClient() {
+	if c.consoleClientErr != nil {
+		c.stlClient = nil
+		c.stlClientErr = c.consoleClientErr
+		return
+	}
+	region := c.Region
+	if region == "" {
+		region = "dev"
+	}
+	ac, err := config.New(config.WithRegion(c.Region))
+	if err == nil {
+		if url := ac.Service("stl").URL; c.STLURL == "" {
+			c.STLURL = url
+		}
+	}
+	client, err := stl.NewClient(c.consoleClient, &stl.Config{
+		STLAPIURL: c.STLURL,
+		DebugLog:  c.DebugLog,
+	})
+	if err != nil {
+		c.stlClient = nil
+		c.stlClientErr = err
+		return
+	}
+	c.stlClient = client
+}
+
 func (c *Config) setupS3CredsClient() {
 	if c.iamClientErr != nil {
-		c.credsClient = nil
+		c.s3credsClient = nil
 		c.credsClientErr = c.iamClientErr
 		return
 	}
@@ -121,16 +176,16 @@ func (c *Config) setupS3CredsClient() {
 			}
 		}
 	}
-	client, err := credentials.NewClient(c.iamClient, &credentials.Config{
+	client, err := s3creds.NewClient(c.iamClient, &s3creds.Config{
 		BaseURL:  c.S3CredsURL,
 		DebugLog: c.DebugLog,
 	})
 	if err != nil {
-		c.credsClient = nil
+		c.s3credsClient = nil
 		c.credsClientErr = err
 		return
 	}
-	c.credsClient = client
+	c.s3credsClient = client
 }
 
 // setupCartelClient sets up an Cartel client
@@ -211,4 +266,51 @@ func (c *Config) getFHIRClient(baseURL, rootOrgID string) (*cdr.Client, error) {
 		return nil, fmt.Errorf("getFHIRClient: %w", err)
 	}
 	return client, nil
+}
+
+func (c *Config) Debug(format string, a ...interface{}) (int, error) {
+	if c.debugFile != nil {
+		output := fmt.Sprintf(format, a...)
+		return c.debugFile.WriteString(output)
+	}
+	return 0, nil
+}
+
+func (c *Config) getDICOMConfigClient(url string) (*dicom.Client, error) {
+	if c.iamClientErr != nil {
+		return nil, fmt.Errorf("DICM client error in getDICOMConfigClient: %w", c.iamClientErr)
+	}
+	client, err := dicom.NewClient(c.iamClient, &dicom.Config{
+		DICOMConfigURL: url,
+		TimeZone:       c.TimeZone,
+		DebugLog:       c.DebugLog,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("getDICOMConfigClient: %w", err)
+	}
+	return client, nil
+}
+
+func (c *Config) setupPKIClient() {
+	if c.iamClientErr != nil {
+		c.pkiClientErr = fmt.Errorf("IAM client error in setupPKIClient: %w", c.iamClientErr)
+		return
+	}
+	if c.consoleClientErr != nil {
+		c.pkiClientErr = fmt.Errorf("Console client error in setupPKIClient: %w", c.consoleClientErr)
+		return
+	}
+	client, err := pki.NewClient(c.consoleClient, c.iamClient, &pki.Config{
+		Region:      c.Region,
+		Environment: c.Environment,
+		DebugLog:    c.DebugLog,
+	})
+	if err != nil {
+		c.pkiClient = nil
+		c.pkiClientErr = err
+		return
+	}
+	c.pkiClient = client
+	c.pkiClientErr = nil
+	return
 }
